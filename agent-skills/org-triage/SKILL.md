@@ -28,18 +28,21 @@ Accepts an **org name** or an explicit **repo list**. Each phase can run indepen
 
 ## Model Routing
 
-Route each phase to the cheapest model that can handle its complexity. Analysis needs judgment (Opus). Fixing is mechanical (Sonnet). Monitoring is formulaic (Haiku).
+Route each phase to the cheapest model that can handle its complexity. Use adaptive routing based on repo size — most repos don't need Opus for analysis.
 
 | Phase | Model | Effort | Rationale |
 |-------|-------|--------|-----------|
 | Discovery | haiku | low | `gh api` calls, no judgment |
-| Deep Analysis | opus | high | Spot subtle bugs, assess code patterns, rate severity |
-| Synthesis | opus | high | Cross-repo pattern recognition, prioritization |
+| Deep Analysis (small repos, <500 files) | sonnet | high | Sufficient for gap detection in typical repos |
+| Deep Analysis (large repos, 500+ files or complex languages) | opus | high | Needed for subtle bugs in large codebases |
+| Synthesis | sonnet | high | Cross-repo pattern recognition — sonnet handles this well |
 | Quick-Win PRs | sonnet | medium | Mechanical grep → edit → commit → push |
 | Meaningful PRs | sonnet | high | Changes already specified by analysis |
 | Issue Filing | sonnet | medium | Writing issue bodies from structured findings |
 | Stale Triage | haiku | low | Formulaic comments with evidence from analysis |
 | Monitoring | haiku | low | `gh pr view` + status parsing |
+
+**Adaptive routing:** During discovery, fetch repo size via `gh api` (`size` field, in KB). Repos under 10MB with <500 files use Sonnet for analysis; larger or polyglot repos use Opus. This saves ~40% on analysis cost for typical orgs.
 
 When using the Workflow tool, pass `model` and `effort` to each `agent()` call. When using subagents via the Agent tool, pass the `model` parameter.
 
@@ -107,12 +110,14 @@ Then clone with `GIT_CONFIG_GLOBAL="${WORK_DIR}/.gitconfig"` so each repo picks 
 **Incremental re-run:** If `scan-results.json` exists from a previous run, load it. Skip repos with no new commits since `last_scanned_at`. In Phase 3, skip findings that already match an open PR in `pr-tracker.json`.
 
 ```bash
-# Fetch all repos, paginated
+# Fetch all repos, paginated — include size for adaptive model routing
 gh api "orgs/${ORG}/repos" --paginate \
-  --jq '.[] | select(.archived == false) | {name, full_name, stargazers_count, language, default_branch, updated_at}'
+  --jq '.[] | select(.archived == false) | select(.size > 0) | {name, full_name, stargazers_count, language, default_branch, updated_at, size}'
 ```
 
 Sort by `stargazers_count` desc. Cap at `MAX_REPOS`.
+
+**Pre-filter:** Skip repos with `size == 0` (empty/placeholder repos). These waste an analysis agent and produce no actionable findings.
 
 Then for each repo, fetch labels that signal contribution-friendliness:
 
@@ -121,7 +126,7 @@ gh issue list -R "${ORG}/${REPO}" --label "good first issue" --state open --json
 gh issue list -R "${ORG}/${REPO}" --label "help wanted" --state open --json number,title,labels
 ```
 
-**Output:** A JSON array of repo objects:
+**Output:** A JSON array of repo objects (empty repos with `size == 0` are excluded):
 
 ```json
 [{
@@ -130,10 +135,13 @@ gh issue list -R "${ORG}/${REPO}" --label "help wanted" --state open --json numb
   "stars": 1234,
   "language": "Python",
   "default_branch": "main",
+  "size": 4500,
   "good_first_issues": 3,
   "help_wanted_issues": 7
 }]
 ```
+
+The `size` field (KB) is used for adaptive model routing in Phase 2 — repos under 10MB use Sonnet, larger repos use Opus.
 
 ---
 
@@ -194,6 +202,7 @@ Each agent returns JSON matching this structure:
   ],
   "easy_contributions": [
     {
+      "gap_index": 0,
       "category": "quick_win|bug_fix|security|dx|docs|test",
       "title": "Short PR title",
       "description": "What to change",
@@ -225,6 +234,10 @@ Each agent returns JSON matching this structure:
   }
 }
 ```
+
+### Dedup: gaps vs easy_contributions
+
+Each `easy_contributions` entry MUST reference a `gap_index` (0-based index into the `gaps` array). Do NOT duplicate the same finding as both a gap and an easy_contribution with different descriptions — the gap is the problem, the easy_contribution is the proposed fix for that gap. If a gap has no actionable fix, omit it from easy_contributions. If a fix doesn't map to a gap, add the gap first.
 
 ### What Makes a Good First Contribution
 
@@ -280,11 +293,20 @@ After all agents return, a synthesis agent combines findings into a prioritized 
 
 ### Pre-fork (batch)
 
-Before fanning out fix agents, fork all target repos in a single batch to avoid rate limiting:
+Before forking, check which repos the user already has forks of to avoid duplicates:
 
 ```bash
+# Get list of existing forks
+EXISTING_FORKS=$(gh repo list "${USER}" --fork --json nameWithOwner --jq '.[].nameWithOwner')
+
+# Fork only repos not already forked
 for repo in $TARGET_REPOS; do
-  gh repo fork "$repo" --clone=false 2>/dev/null &
+  repo_name=$(echo "$repo" | cut -d/ -f2)
+  if echo "$EXISTING_FORKS" | grep -q "${USER}/${repo_name}"; then
+    echo "Already forked: $repo"
+  else
+    gh repo fork "$repo" --clone=false 2>/dev/null &
+  fi
 done
 wait
 ```
@@ -464,20 +486,21 @@ If this is no longer relevant, it may be worth closing. Happy to help verify if 
 
 ### Cost Tracking
 
-Track and report token usage per phase. Include in the tracker file a summary:
+Track token usage using the workflow tool's `totalTokens` field from each workflow result. Per-agent breakdowns are not available from the runtime — report **per-phase totals** (one workflow per phase) and **estimated costs** based on the model used.
 
 ```markdown
 ## Cost Summary
 
-| Phase | Agents | Tokens | Est. Cost |
-|-------|--------|--------|-----------|
-| Discovery | 1 | 5k | $0.01 |
-| Analysis | 20 | 800k | $12.00 |
-| Quick-Win PRs | 15 | 200k | $0.60 |
-| Meaningful PRs | 12 | 300k | $0.90 |
-| Triage | 1 | 10k | $0.01 |
-| **Total** | **49** | **1.3M** | **$13.52** |
+| Phase | Agents | Tokens | Model | Est. Cost |
+|-------|--------|--------|-------|-----------|
+| Discovery | 1 (inline) | ~2k | haiku | $0.01 |
+| Analysis | N | from workflow result | sonnet/opus | varies |
+| Quick-Win PRs | N | from workflow result | sonnet | varies |
+| Triage | 1 | ~10k | haiku | $0.01 |
+| **Total** | **sum** | **sum** | | **sum** |
 ```
+
+**Note:** Token counts come from the `totalTokens` field in each Workflow tool result. Per-agent granularity is not available — only the aggregate per workflow run. Cost estimates use published per-token pricing for the model tier used.
 
 ### Tracker File
 
@@ -556,6 +579,8 @@ Each phase is independent:
 Never exceed 25 concurrent agents. If the contribution list is longer, batch in waves of 15-20.
 
 **Pattern dedup:** Before the fix stage in the pipeline, group findings by type. For patterns in 3+ repos, create one template and distribute to all fix agents for that pattern.
+
+**Bundle community health files:** When a repo is missing multiple community health files (SECURITY.md, .editorconfig, CODEOWNERS, CONTRIBUTING.md, CHANGELOG.md), bundle them into a single "Add community health files" PR per repo. Do NOT open separate PRs for each file — that floods maintainers with noise and makes the contributor look like a bot. One well-structured PR with all missing files is easier to review and more likely to merge.
 
 ---
 
